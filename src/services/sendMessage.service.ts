@@ -38,6 +38,46 @@ function logError(event: string, payload: Record<string, unknown> = {}): void {
     );
 }
 
+function getResponseMessage(data: unknown): string | null {
+    if (!data || typeof data !== "object") return null;
+
+    const response = (data as { response?: unknown }).response;
+    if (response && typeof response === "object") {
+        const message = (response as { message?: unknown }).message;
+        if (Array.isArray(message)) return message.map(String).join(" | ");
+        if (message) return String(message);
+    }
+
+    const message = (data as { message?: unknown; error?: unknown }).message;
+    if (Array.isArray(message)) return message.map(String).join(" | ");
+    if (message) return String(message);
+
+    const error = (data as { error?: unknown }).error;
+    return error ? String(error) : null;
+}
+
+function formatAxiosError(err: unknown, context: Record<string, unknown>): string {
+    if (!axios.isAxiosError(err)) {
+        const message = err instanceof Error ? err.message : String(err);
+        return JSON.stringify({ ...context, message }, null, 2);
+    }
+
+    const responseData = err.response?.data ?? null;
+    return JSON.stringify(
+        {
+            ...context,
+            message: err.message,
+            code: err.code ?? null,
+            http_status: err.response?.status ?? null,
+            http_status_text: err.response?.statusText ?? null,
+            api_message: getResponseMessage(responseData),
+            response: responseData,
+        },
+        null,
+        2
+    );
+}
+
 // Sanitiza e valida número (E.164-like: só dígitos, exige DDI+DDD, mínimo 10 dígitos)
 function sanitizeNumber(input: unknown): string {
     const digits = String(input ?? "").replace(/\D/g, "");
@@ -168,30 +208,36 @@ export async function sendMessage({
     } catch (err: unknown) {
         const elapsedMs = Date.now() - start;
 
-        const e = err as {
-            code?: string;
-            response?: { status?: number; data?: unknown };
-        };
-
-        const status = e?.response?.status ?? null;
-
-        const responseData = e?.response?.data ?? null;
+        const status = axios.isAxiosError(err) ? err.response?.status ?? null : null;
+        const responseData = axios.isAxiosError(err) ? err.response?.data ?? null : null;
+        const apiMessage = getResponseMessage(responseData);
 
         logError("send_text_error", {
             to,
             instance,
             http_status: status,
-            code: e?.code ?? null,
+            code: axios.isAxiosError(err) ? err.code ?? null : null,
             elapsed_ms: elapsedMs,
+            api_message: apiMessage,
             response: responseData,
         });
 
+        console.error(
+            "❌ Erro detalhado ao enviar WhatsApp:\n" +
+            formatAxiosError(err, {
+                method: "POST",
+                url,
+                instance,
+                to,
+                elapsed_ms: elapsedMs,
+            })
+        );
+
         const friendly = new Error(
             status
-                ? `Falha ao enviar (HTTP ${status}). Verifique número/instância/cotas.`
-                : `Falha ao enviar (erro de rede/timeout).`
+                ? `Falha ao enviar WhatsApp (HTTP ${status})${apiMessage ? `: ${apiMessage}` : "."}`
+                : `Falha ao enviar WhatsApp (erro de rede/timeout).`
         );
-        (friendly as any).cause = err;
         throw friendly;
     }
 }

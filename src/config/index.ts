@@ -5,8 +5,20 @@ import { conectarAoBanco } from "../services/database.service.js";
 import { getEstoqueProdTiny } from "../services/tinyApi.service.js";
 import { listaEmpresasDefinidas, listaTelefones, instanceWhatsApp, sendMessageMain } from "../main.js";
 import { buildHistoryDbConfig } from "./historyDb.config.js";
+import {
+    finalizarRelatorioHomologacao,
+    registrarProblemaHomologacao,
+} from "../services/homologacaoReport.service.js";
 
 export const historyDbConfig = buildHistoryDbConfig();
+
+function registrarErroValidacaoConfig(mensagem: string, dados?: Record<string, unknown>): void {
+    registrarProblemaHomologacao({
+        tipo: "erro_validacao",
+        mensagem,
+        dados,
+    });
+}
 
 // ======================= TIPOS (mínimos, práticos) =======================
 
@@ -83,18 +95,20 @@ export async function logEnvVariables(): Promise<boolean> {
         if (evoBaseUrl.length > 0) {
             console.log("🔗 Url base para o EvolutionAPI capturada do .env com sucesso! ✅");
         } else {
-            console.error(
-                "❌ Erro: Por favor, defina a URL base do Evolution API no .env com a variável EVO_BASE_URL."
-            );
+            const msg = "❌ Erro: Por favor, defina a URL base do Evolution API no .env com a variável EVO_BASE_URL.";
+            console.error(msg);
+            registrarErroValidacaoConfig(msg, { variavel: "EVO_BASE_URL" });
+            finalizarRelatorioHomologacao("finalizado_com_erros");
             process.exit(1);
         }
 
         if (evoApiKey.length > 0) {
             console.log("🔑 Chave de API para o EvolutionAPI capturada do .env com sucesso! ✅");
         } else {
-            console.error(
-                "❌ Erro: Por favor, defina a chave de API do Evolution API no .env com a variável EVO_API_KEY."
-            );
+            const msg = "❌ Erro: Por favor, defina a chave de API do Evolution API no .env com a variável EVO_API_KEY.";
+            console.error(msg);
+            registrarErroValidacaoConfig(msg, { variavel: "EVO_API_KEY" });
+            finalizarRelatorioHomologacao("finalizado_com_erros");
             process.exit(1);
         }
 
@@ -102,21 +116,23 @@ export async function logEnvVariables(): Promise<boolean> {
             instanceWhatsApp.push(instance);
             console.log("🤝 Instância do Evolution API Capturada:", instanceWhatsApp[0], "✅");
         } else {
-            console.error(
-                "❌ Erro: Por favor, defina o nome da instância do Evolution API no .env com a variável INSTANCE_WAPI."
-            );
+            const msg = "❌ Erro: Por favor, defina o nome da instância do Evolution API no .env com a variável INSTANCE_WAPI.";
+            console.error(msg);
+            registrarErroValidacaoConfig(msg, { variavel: "INSTANCE_WAPI" });
+            finalizarRelatorioHomologacao("finalizado_com_erros");
             process.exit(1);
         }
 
         for (const tel of telEmEnv) {
             const telefone = process.env[`${tel}_TEL`];
             if (!telefone) {
-                console.error(
-                    `❌ Erro: Foi realizado uma busca no .env de um número inválido. Por favor, adicione um ${tel}_TEL no .env.`
-                );
+                const msg = `❌ Erro: Foi realizado uma busca no .env de um número inválido. Por favor, adicione um ${tel}_TEL no .env.`;
+                console.error(msg);
+                registrarErroValidacaoConfig(msg, { variavel: `${tel}_TEL`, telefone: tel });
                 await sendMessageMain(
-                    `❌ Erro: Foi realizado uma busca no .env de um número inválido. Por favor, adicione um ${tel}_TEL no .env.`
+                    msg
                 );
+                finalizarRelatorioHomologacao("finalizado_com_erros");
                 process.exit(1);
             }
             listaTelefones.push(telefone);
@@ -127,23 +143,24 @@ export async function logEnvVariables(): Promise<boolean> {
         console.log("⚠️   EM CASO DE ERRO, NINGUÉM SERÁ NOTIFICADO!!!   ⚠️");
         console.log("🔥🔥🔥 Continuando assim mesmo... 🔥🔥🔥");
         console.log("======================================================");
-        process.exit(1); // mantido como está no seu JS
     }
 
     if (variaveisFaltando.length > 0) {
-        console.error(
-            `❌ Erro: As seguintes variáveis de ambiente estão faltando no .env: ${variaveisFaltando.join(", ")}`
-        );
+        const msg = `❌ Erro: As seguintes variáveis de ambiente estão faltando no .env: ${variaveisFaltando.join(", ")}`;
+        console.error(msg);
+        registrarErroValidacaoConfig(msg, { variaveis: variaveisFaltando });
         await sendMessageMain(
-            `❌ Erro: As seguintes variáveis de ambiente estão faltando no .env: ${variaveisFaltando.join(", ")}`
+            msg
         );
         return false;
     }
 
     const activeCompanies = process.env.ACTIVE_COMPANIES;
     if (!activeCompanies) {
-        console.error("❌ Erro: ACTIVE_COMPANIES não definido no .env");
-        await sendMessageMain("❌ Erro: ACTIVE_COMPANIES não definido no .env");
+        const msg = "❌ Erro: ACTIVE_COMPANIES não definido no .env";
+        console.error(msg);
+        registrarErroValidacaoConfig(msg, { variavel: "ACTIVE_COMPANIES" });
+        await sendMessageMain(msg);
         return false;
     }
 
@@ -167,24 +184,29 @@ export async function logEnvVariables(): Promise<boolean> {
         let tokenQuery: string | null = null;
 
         if (!nomeEmpresa) {
-            console.error(
-                `[❌ DADOS INCOMPLETOS] Por favor preencha o campo "${empresa}_NOME" para a empresa ${nomeEmpresa}/${empresa}.`
-            );
-            await sendMessageMain(
-                `[❌ DADOS INCOMPLETOS] Por favor preencha o campo "${empresa}_NOME" para a empresa ${nomeEmpresa}/${empresa}.`
-            );
+            const msg = `[❌ DADOS INCOMPLETOS] Por favor preencha o campo "${empresa}_NOME" para a empresa ${nomeEmpresa}/${empresa}.`;
+            console.error(msg);
+            registrarErroValidacaoConfig(msg, { empresa, variavel: `${empresa}_NOME` });
+            await sendMessageMain(msg);
+            finalizarRelatorioHomologacao("finalizado_com_erros");
             process.exit(1);
         }
 
         if (idDeposito === undefined || idDeposito === null || idDeposito === "") {
-            console.error(
-                `[❌ DADOS INCOMPLETOS] Por favor preencha o campo "${empresa}_ID_DEPOSITO" para a empresa ${nomeEmpresa}/${empresa}.`
-            );
+            const msg = `[❌ DADOS INCOMPLETOS] Por favor preencha o campo "${empresa}_ID_DEPOSITO" para a empresa ${nomeEmpresa}/${empresa}.`;
+            console.error(msg);
             console.error(
                 "[❌ DADOS INCOMPLETOS] O script não será encerrado, ele listará os IDs de depósito disponíveis e então ele irá encerrar."
             );
+            registrarProblemaHomologacao({
+                tipo: "deposito_nao_definido",
+                empresa,
+                nomeEmpresa,
+                mensagem: msg,
+                dados: { variavel: `${empresa}_ID_DEPOSITO` },
+            }, { resumoValor: empresa });
             await sendMessageMain(
-                `[❌ DADOS INCOMPLETOS] Por favor preencha o campo "${empresa}_ID_DEPOSITO" para a empresa ${nomeEmpresa}/${empresa}.`
+                msg
             );
             await sendMessageMain(
                 "[❌ DADOS INCOMPLETOS] O script não será encerrado, ele listará os IDs de depósito disponíveis e então ele irá encerrar."
@@ -194,14 +216,16 @@ export async function logEnvVariables(): Promise<boolean> {
 
         if (!isMaster) {
             if (!userTiny || !passTiny) {
-                console.error(
-                    `[❌ DADOS INCOMPLETOS] Por favor preencha os campos "${empresa}_USER_TINY" e "${empresa}_PASS_TINY"`
-                );
+                const msg = `[❌ DADOS INCOMPLETOS] Por favor preencha os campos "${empresa}_USER_TINY" e "${empresa}_PASS_TINY"`;
+                console.error(msg);
                 console.error(`[❌ DADOS INCOMPLETOS] Sem eles não será possível baixar a planilha de estoque.`);
-                await sendMessageMain(
-                    `[❌ DADOS INCOMPLETOS] Por favor preencha os campos "${empresa}_USER_TINY" e "${empresa}_PASS_TINY"`
-                );
+                registrarErroValidacaoConfig(msg, {
+                    empresa,
+                    variaveis: [`${empresa}_USER_TINY`, `${empresa}_PASS_TINY`],
+                });
+                await sendMessageMain(msg);
                 await sendMessageMain(`[❌ DADOS INCOMPLETOS] Sem eles não será possível baixar a planilha de estoque.`);
+                finalizarRelatorioHomologacao("finalizado_com_erros");
                 process.exit(1);
             }
         }
@@ -209,32 +233,29 @@ export async function logEnvVariables(): Promise<boolean> {
         if (tokenSource === "env") {
             empresaToken = process.env[`${empresa}_TOKEN`] ?? null;
             if (!empresaToken) {
-                console.error(
-                    `[❌ DADOS INCOMPLETOS] Por favor preencha o campo "${empresa}_TOKEN" para a empresa ${nomeEmpresa}/${empresa}.`
-                );
-                await sendMessageMain(
-                    `[❌ DADOS INCOMPLETOS] Por favor preencha o campo "${empresa}_TOKEN" para a empresa ${nomeEmpresa}/${empresa}.`
-                );
+                const msg = `[❌ DADOS INCOMPLETOS] Por favor preencha o campo "${empresa}_TOKEN" para a empresa ${nomeEmpresa}/${empresa}.`;
+                console.error(msg);
+                registrarErroValidacaoConfig(msg, { empresa, variavel: `${empresa}_TOKEN` });
+                await sendMessageMain(msg);
+                finalizarRelatorioHomologacao("finalizado_com_erros");
                 process.exit(1);
             }
         } else if (tokenSource === "db") {
             tokenQuery = process.env[`${empresa}_TOKEN_QUERY`] ?? null;
             if (!tokenQuery) {
-                console.error(
-                    `[❌ DADOS INCOMPLETOS] Por favor preencha o campo "${empresa}_TOKEN_QUERY" para a empresa ${nomeEmpresa}/${empresa}.`
-                );
-                await sendMessageMain(
-                    `[❌ DADOS INCOMPLETOS] Por favor preencha o campo "${empresa}_TOKEN_QUERY" para a empresa ${nomeEmpresa}/${empresa}.`
-                );
+                const msg = `[❌ DADOS INCOMPLETOS] Por favor preencha o campo "${empresa}_TOKEN_QUERY" para a empresa ${nomeEmpresa}/${empresa}.`;
+                console.error(msg);
+                registrarErroValidacaoConfig(msg, { empresa, variavel: `${empresa}_TOKEN_QUERY` });
+                await sendMessageMain(msg);
+                finalizarRelatorioHomologacao("finalizado_com_erros");
                 process.exit(1);
             }
         } else {
-            console.error(
-                `[❌ DADOS INCOMPLETOS] Por favor, preencha corretamente o campo "tokenSource" com 'env' ou 'db' para a empresa ${nomeEmpresa}/${empresa}.`
-            );
-            await sendMessageMain(
-                `[❌ DADOS INCOMPLETOS] Por favor, preencha corretamente o campo "tokenSource" com 'env' ou 'db' para a empresa ${nomeEmpresa}/${empresa}.`
-            );
+            const msg = `[❌ DADOS INCOMPLETOS] Por favor, preencha corretamente o campo "tokenSource" com 'env' ou 'db' para a empresa ${nomeEmpresa}/${empresa}.`;
+            console.error(msg);
+            registrarErroValidacaoConfig(msg, { empresa, variavel: `${empresa}_TOKEN_SOURCE`, valor: tokenSource });
+            await sendMessageMain(msg);
+            finalizarRelatorioHomologacao("finalizado_com_erros");
             process.exit(1);
         }
 
@@ -242,19 +263,20 @@ export async function logEnvVariables(): Promise<boolean> {
     }
 
     if (masters.filter((v) => v.isMaster === true).length !== 1) {
-        console.error(
-            `[❌ DADOS INCOMPLETOS] Foi identificado que no .env há um erro com relação à empresa MASTER (principal).`
-        );
+        const msg = `[❌ DADOS INCOMPLETOS] Foi identificado que no .env há um erro com relação à empresa MASTER (principal).`;
+        console.error(msg);
         console.error(
             "[❌ DADOS INCOMPLETOS] Lembrando que deve ter EXATAMENTE uma empresa master, deve haver somente uma!"
         );
+        registrarErroValidacaoConfig(msg, { masters });
         await sendMessageMain(
-            `[❌ DADOS INCOMPLETOS] Foi identificado que no .env há um erro com relação à empresa MASTER (principal).`
+            msg
         );
         await sendMessageMain(
             "[❌ DADOS INCOMPLETOS] Lembrando que deve ter EXATAMENTE uma empresa master, deve haver somente uma!"
         );
         console.log(masters);
+        finalizarRelatorioHomologacao("finalizado_com_erros");
         process.exit(1);
     }
 
@@ -295,16 +317,22 @@ export async function definirEmpresas(): Promise<EmpresaDefinida[]> {
         let tokenQuery: string | null = null;
 
         if (!nomeEmpresa) {
-            console.error(`Por favor preencha o campo "${empresa}_NOME" para a empresa ${nomeEmpresa}/${empresa}.`);
-            await sendMessageMain(`Por favor preencha o campo "${empresa}_NOME" para a empresa ${nomeEmpresa}/${empresa}.`);
+            const msg = `Por favor preencha o campo "${empresa}_NOME" para a empresa ${nomeEmpresa}/${empresa}.`;
+            console.error(msg);
+            registrarErroValidacaoConfig(msg, { empresa, variavel: `${empresa}_NOME` });
+            await sendMessageMain(msg);
+            finalizarRelatorioHomologacao("finalizado_com_erros");
             process.exit(1);
         }
 
         if (tokenSource === "env") {
             empresaToken = process.env[`${empresa}_TOKEN`] ?? null;
             if (!empresaToken) {
-                console.error(`Por favor preencha o campo "${empresa}_TOKEN" para a empresa ${nomeEmpresa}/${empresa}.`);
-                await sendMessageMain(`Por favor preencha o campo "${empresa}_TOKEN" para a empresa ${nomeEmpresa}/${empresa}.`);
+                const msg = `Por favor preencha o campo "${empresa}_TOKEN" para a empresa ${nomeEmpresa}/${empresa}.`;
+                console.error(msg);
+                registrarErroValidacaoConfig(msg, { empresa, variavel: `${empresa}_TOKEN` });
+                await sendMessageMain(msg);
+                finalizarRelatorioHomologacao("finalizado_com_erros");
                 process.exit(1);
             }
 
@@ -325,8 +353,11 @@ export async function definirEmpresas(): Promise<EmpresaDefinida[]> {
         } else if (tokenSource === "db") {
             tokenQuery = process.env[`${empresa}_TOKEN_QUERY`] ?? null;
             if (!tokenQuery) {
-                console.error(`Por favor preencha o campo "${empresa}_TOKEN_QUERY" para a empresa ${nomeEmpresa}/${empresa}.`);
-                await sendMessageMain(`Por favor preencha o campo "${empresa}_TOKEN_QUERY" para a empresa ${nomeEmpresa}/${empresa}.`);
+                const msg = `Por favor preencha o campo "${empresa}_TOKEN_QUERY" para a empresa ${nomeEmpresa}/${empresa}.`;
+                console.error(msg);
+                registrarErroValidacaoConfig(msg, { empresa, variavel: `${empresa}_TOKEN_QUERY` });
+                await sendMessageMain(msg);
+                finalizarRelatorioHomologacao("finalizado_com_erros");
                 process.exit(1);
             }
 
@@ -348,13 +379,12 @@ export async function definirEmpresas(): Promise<EmpresaDefinida[]> {
             console.error("======######======");
             console.error("ERRO INESPERADO!!!");
             console.error("======######======");
-            console.error(
-                `Por favor, preencha corretamente o campo "tokenSource" com 'env' ou 'db' para a empresa ${nomeEmpresa}/${empresa}.`
-            );
+            const msg = `Por favor, preencha corretamente o campo "tokenSource" com 'env' ou 'db' para a empresa ${nomeEmpresa}/${empresa}.`;
+            console.error(msg);
+            registrarErroValidacaoConfig(msg, { empresa, variavel: `${empresa}_TOKEN_SOURCE`, valor: tokenSource });
             await sendMessageMain("🚨 ERRO INESPERADO!!! 🚨");
-            await sendMessageMain(
-                `Por favor, preencha corretamente o campo "tokenSource" com 'env' ou 'db' para a empresa ${nomeEmpresa}/${empresa}.`
-            );
+            await sendMessageMain(msg);
+            finalizarRelatorioHomologacao("finalizado_com_erros");
             process.exit(1);
         }
     }
@@ -365,9 +395,15 @@ export async function definirEmpresas(): Promise<EmpresaDefinida[]> {
     console.error("ERRO INESPERADO!!!");
     console.error("listaCompleta.length === 0");
     console.error("======######======");
+    registrarProblemaHomologacao({
+        tipo: "erro_inesperado",
+        contexto: "definirEmpresas",
+        mensagem: "listaCompleta.length === 0",
+    });
     await sendMessageMain("🚨 ERRO INESPERADO!!! 🚨");
     await sendMessageMain("listaCompleta.length === 0");
     await sendMessageMain("Isso significa que não foi definida nenhuma empresa no .env (Meio impossível... mas dá uma olhada)");
+    finalizarRelatorioHomologacao("finalizado_com_erros");
     process.exit(1);
 }
 
@@ -380,8 +416,15 @@ export async function semDepositosEnv(): Promise<never> {
     console.log("LISTANDO DEPOSITOS...\n");
 
     if (!listaEmpresasDefinidas || listaEmpresasDefinidas.length === 0) {
-        console.error("❌ listaEmpresasDefinidas está vazia/null. Chame definirEmpresas() antes.");
-        await sendMessageMain("❌ listaEmpresasDefinidas está vazia/null. Chame definirEmpresas() antes.");
+        const msg = "❌ listaEmpresasDefinidas está vazia/null. Chame definirEmpresas() antes.";
+        console.error(msg);
+        registrarProblemaHomologacao({
+            tipo: "erro_inesperado",
+            contexto: "semDepositosEnv",
+            mensagem: msg,
+        });
+        await sendMessageMain(msg);
+        finalizarRelatorioHomologacao("finalizado_com_erros");
         process.exit(1);
     }
 
@@ -409,5 +452,6 @@ export async function semDepositosEnv(): Promise<never> {
         console.log("\n");
     }
 
+    finalizarRelatorioHomologacao("finalizado_com_erros");
     process.exit(0);
 }

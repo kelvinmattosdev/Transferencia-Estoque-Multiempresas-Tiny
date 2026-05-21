@@ -37,6 +37,16 @@ import {
 // ## sendMessage.service.js ##
 import { sendMessage } from "./services/sendMessage.service.js";
 
+// ## homologacaoReport.service.js ##
+import {
+    finalizarRelatorioHomologacao,
+    getRelatorioHomologacaoPath,
+    iniciarRelatorioHomologacao,
+    prepararCategoriasEmpresasHomologacao,
+    registrarProblemaHomologacao,
+    registrarProdutoNaoExiste,
+} from "./services/homologacaoReport.service.js";
+
 // Imports adicionais
 import { randomUUID } from "crypto";
 
@@ -111,6 +121,7 @@ async function resolveCompanyIdForHistory(empresaCodigo: string): Promise<number
 }
 
 async function main(): Promise<void> {
+    iniciarRelatorioHomologacao();
     await allValidations();
 
     // || ================ BAIXA A PLANILHA DE ESTOQUE ================ || \\
@@ -124,9 +135,10 @@ async function main(): Promise<void> {
         // proteção extra (teoricamente allValidations garante)
         throw new Error("listaEmpresasDefinidas não foi inicializada.");
     }
+    const empresasDefinidas = listaEmpresasDefinidas;
 
     // Baixa cada uma das planilhas de estoque (exceto da empresa principal)
-    for (const empresa of listaEmpresasDefinidas) {
+    for (const empresa of empresasDefinidas) {
         if (empresa.isMaster) continue; // Pula a empresa principal
         const e = empresa;
 
@@ -134,7 +146,14 @@ async function main(): Promise<void> {
         if (idDeposito === undefined || idDeposito === null || idDeposito === "") {
             const msg = `❌ Empresa ${e.empresa} está sem idDeposito definido. Verifique o .env (_ID_DEPOSITO).`;
             console.error(msg);
+            registrarProblemaHomologacao({
+                tipo: "deposito_nao_definido",
+                empresa: e.empresa,
+                nomeEmpresa: e.nomeEmpresa,
+                mensagem: msg,
+            }, { resumoValor: e.empresa });
             await sendMessageMain(msg);
+            finalizarRelatorioHomologacao("finalizado_com_erros");
             process.exit(1);
         }
 
@@ -153,7 +172,7 @@ async function main(): Promise<void> {
     console.log(objPathPlanilhas);
     console.log("==== [ END ] ====");
 
-    for (const empresa of listaEmpresasDefinidas) {
+    for (const empresa of empresasDefinidas) {
         if (empresa.isMaster) continue; // Pula a empresa principal
 
         const filterMap: Record<string, string | null> = {
@@ -186,13 +205,27 @@ async function main(): Promise<void> {
             `Foram localizados ${a.length} produtos com o estoque ${messageEstoque} na empresa ${empresa.nomeEmpresa}`
         );
 
-        const objEmpresaMaster = listaEmpresasDefinidas.find((v) => v.isMaster === true);
+        const objEmpresaMaster = empresasDefinidas.find((v) => v.isMaster === true);
         if (!objEmpresaMaster) {
+            registrarProblemaHomologacao({
+                tipo: "erro_validacao",
+                mensagem: "Empresa Master não encontrada em listaEmpresasDefinidas.",
+            });
+            finalizarRelatorioHomologacao("finalizado_com_erros");
             throw new Error("Empresa Master não encontrada em listaEmpresasDefinidas.");
         }
 
         for (const p of a) {
-            if (!p.codigo_sku) continue;
+            if (!p.codigo_sku) {
+                registrarProblemaHomologacao({
+                    tipo: "sku_vazio_planilha",
+                    empresa: empresa.empresa,
+                    nomeEmpresa: empresa.nomeEmpresa,
+                    mensagem: `Linha da planilha sem SKU na empresa ${empresa.nomeEmpresa}.`,
+                    dados: { estoque_atual: p.estoque_atual },
+                });
+                continue;
+            }
             const ok = await transfEstoque(p, empresa, objEmpresaMaster);
             if (!ok) continue;
         }
@@ -209,7 +242,9 @@ Até a próxima execução! 👋`);
     console.log("📊 Estoques atualizados e sincronizados.");
     console.log("🔒 Sistema encerrado com segurança.");
     console.log("Até a próxima execução! 👋\n");
+    console.log(`🧾 Relatório de homologação salvo em: ${getRelatorioHomologacaoPath()}`);
 
+    finalizarRelatorioHomologacao("concluido");
     process.exit(0);
 }
 
@@ -218,12 +253,18 @@ async function allValidations(): Promise<void> {
     const allVariables = await logEnvVariables();
 
     if (!allVariables) {
+        const msg = "❌ Erro: Falha na validação das variáveis de ambiente. Verifique o .env e tente novamente.";
         console.error(
-            "❌ Erro: Falha na validação das variáveis de ambiente. Verifique o .env e tente novamente."
+            msg
         );
+        registrarProblemaHomologacao({
+            tipo: "erro_validacao",
+            mensagem: msg,
+        });
         await sendMessageMain(
-            "❌ Erro: Falha na validação das variáveis de ambiente. Verifique o .env e tente novamente."
+            msg
         );
+        finalizarRelatorioHomologacao("finalizado_com_erros");
         process.exit(1);
     }
 
@@ -234,12 +275,18 @@ async function allValidations(): Promise<void> {
     if (!okDb) {
         const msg = "❌ Banco de dados indisponível. Abortando execução por segurança.";
         console.error(msg);
+        registrarProblemaHomologacao({
+            tipo: "erro_banco",
+            mensagem: msg,
+        });
         await sendMessageMain(msg);
+        finalizarRelatorioHomologacao("finalizado_com_erros");
         process.exit(1);
     }
 
     // Define as empresas dentro da lista global com todas as variáveis do .env padronizadas corretamente
     listaEmpresasDefinidas = (await definirEmpresas()) as Empresa[];
+    prepararCategoriasEmpresasHomologacao(listaEmpresasDefinidas);
 
     // Captura o AccessToken do Tiny de cada uma das empresas com base no Query
     for (const empresa of listaEmpresasDefinidas) {
@@ -265,7 +312,18 @@ async function allValidations(): Promise<void> {
         if (aindaVazio) {
             const msg = "❌ ID_DEPOSITO ainda está vazio após a validação. Abordando execução por segurança.";
             console.error(msg);
+            for (const empresa of listaEmpresasDefinidas.filter(
+                (v) => v.idDeposito === undefined || v.idDeposito === null || v.idDeposito === ""
+            )) {
+                registrarProblemaHomologacao({
+                    tipo: "deposito_nao_definido",
+                    empresa: empresa.empresa,
+                    nomeEmpresa: empresa.nomeEmpresa,
+                    mensagem: `ID_DEPOSITO vazio para ${empresa.nomeEmpresa} (${empresa.empresa}).`,
+                }, { resumoValor: empresa.empresa });
+            }
             await sendMessageMain(msg);
+            finalizarRelatorioHomologacao("finalizado_com_erros");
             process.exit(1);
         }
     }
@@ -320,6 +378,13 @@ async function transfEstoque(
 
     if (sku === undefined || sku === null || sku === "") {
         console.warn("[WARN] Linha da planilha sem SKU (codigo_sku vazio). Pulando.");
+        registrarProblemaHomologacao({
+            tipo: "sku_vazio_planilha",
+            empresa: empresaFilial.empresa,
+            nomeEmpresa: empresaFilial.nomeEmpresa,
+            mensagem: "Linha da planilha sem SKU (codigo_sku vazio).",
+            dados: { estoque_atual: p.estoque_atual },
+        });
         return true;
     }
 
@@ -340,6 +405,17 @@ async function transfEstoque(
             `[INFO] Estoque não transferível (valor original=${p.estoque_atual}). Nenhuma transferência necessária. Pulando.`,
             true
         );
+        registrarProblemaHomologacao({
+            tipo: "estoque_nao_transferivel",
+            sku: String(sku),
+            empresa: empresaFilial.empresa,
+            nomeEmpresa: empresaFilial.nomeEmpresa,
+            mensagem: `Estoque não transferível para o SKU ${String(sku)}.`,
+            dados: {
+                estoque_original: p.estoque_atual,
+                estoque_normalizado: estoqueNormalizado,
+            },
+        });
         return true;
     }
 
@@ -355,9 +431,15 @@ async function transfEstoque(
 
         const prodMaster = resProdMaster?.itens?.[0];
         if (!prodMaster) {
-            console.error(
-                `[❌ FALHA] Produto não encontrado na empresa principal [${objEmpresaMaster.nomeEmpresa}].`
-            );
+            const msg = `[❌ FALHA] Produto não encontrado na empresa principal [${objEmpresaMaster.nomeEmpresa}].`;
+            console.error(msg);
+            registrarProdutoNaoExiste({
+                sku,
+                escopo: "master",
+                empresa: objEmpresaMaster.empresa,
+                nomeEmpresa: objEmpresaMaster.nomeEmpresa,
+                mensagem: msg,
+            });
             return false;
         }
         console.log(`[OK] Localizado na Master: ${prodMaster.descricao} (ID: ${prodMaster.id})`);
@@ -370,9 +452,15 @@ async function transfEstoque(
 
         const prodFilial = resProdFilial?.itens?.[0];
         if (!prodFilial) {
-            console.error(
-                `[❌ FALHA] Produto não encontrado na empresa filial [${empresaFilial.nomeEmpresa}].`
-            );
+            const msg = `[❌ FALHA] Produto não encontrado na empresa filial [${empresaFilial.nomeEmpresa}].`;
+            console.error(msg);
+            registrarProdutoNaoExiste({
+                sku,
+                escopo: "filial",
+                empresa: empresaFilial.empresa,
+                nomeEmpresa: empresaFilial.nomeEmpresa,
+                mensagem: msg,
+            });
             return false;
         }
         console.log(`[OK] Localizado na Filial: ${prodFilial.descricao} (ID: ${prodFilial.id})`);
@@ -386,6 +474,13 @@ async function transfEstoque(
         if (idDepFilial === undefined || idDepFilial === null || idDepFilial === "") {
             const msg = `❌ Filial ${empresaFilial.empresa} sem idDeposito. Abortando SKU ${String(p.codigo_sku)}.`;
             console.error(msg);
+            registrarProblemaHomologacao({
+                tipo: "deposito_nao_definido",
+                sku: String(sku),
+                empresa: empresaFilial.empresa,
+                nomeEmpresa: empresaFilial.nomeEmpresa,
+                mensagem: msg,
+            }, { resumoValor: `${empresaFilial.empresa}:${String(sku)}` });
             await sendMessageMain(msg);
             return false;
         }
@@ -393,6 +488,13 @@ async function transfEstoque(
         if (idDepMaster === undefined || idDepMaster === null || idDepMaster === "") {
             const msg = `❌ Master ${objEmpresaMaster.empresa} sem idDeposito. Abortando SKU ${String(p.codigo_sku)}.`;
             console.error(msg);
+            registrarProblemaHomologacao({
+                tipo: "deposito_nao_definido",
+                sku: String(sku),
+                empresa: objEmpresaMaster.empresa,
+                nomeEmpresa: objEmpresaMaster.nomeEmpresa,
+                mensagem: msg,
+            }, { resumoValor: `${objEmpresaMaster.empresa}:${String(sku)}` });
             await sendMessageMain(msg);
             return false;
         }
@@ -535,6 +637,20 @@ async function transfEstoque(
             console.error(`   - Status: ${String(error.status)}`);
             console.error(`   - URL: ${String(error.url)}`);
             console.error(`   - Resposta da API: ${JSON.stringify(error.responseData)}`);
+            registrarProblemaHomologacao({
+                tipo: "erro_api_tiny",
+                sku: String(p.codigo_sku),
+                empresa: empresaFilial.empresa,
+                nomeEmpresa: empresaFilial.nomeEmpresa,
+                mensagem: error.message ?? `Falha de API Tiny ao processar SKU ${String(p.codigo_sku)}.`,
+                status: error.status ?? null,
+                url: error.url ?? null,
+                responseData: error.responseData,
+                dados: {
+                    empresa_master: objEmpresaMaster.empresa,
+                    empresa_filial: empresaFilial.empresa,
+                },
+            });
 
             if (error.status === 404) {
                 console.warn(
@@ -552,6 +668,17 @@ async function transfEstoque(
                 `❌ Ocorreu um erro inesperado no processamento do SKU ${String(p.codigo_sku)}:`,
                 error?.message ?? error
             );
+            registrarProblemaHomologacao({
+                tipo: "erro_inesperado",
+                sku: String(p.codigo_sku),
+                empresa: empresaFilial.empresa,
+                nomeEmpresa: empresaFilial.nomeEmpresa,
+                mensagem: error?.message ?? String(error),
+                dados: {
+                    empresa_master: objEmpresaMaster.empresa,
+                    empresa_filial: empresaFilial.empresa,
+                },
+            });
             await sendMessageMain(
                 `❌ Ocorreu um erro inesperado no processamento do SKU ${String(p.codigo_sku)}: ${error?.message ?? String(error)
                 }`
@@ -559,6 +686,13 @@ async function transfEstoque(
         }
 
         console.warn("   ➡️  Ação: A transferência para este produto foi cancelada. Pulando para o próximo.");
+        registrarProblemaHomologacao({
+            tipo: "transferencia_cancelada",
+            sku: String(p.codigo_sku),
+            empresa: empresaFilial.empresa,
+            nomeEmpresa: empresaFilial.nomeEmpresa,
+            mensagem: "A transferência para este produto foi cancelada. Pulando para o próximo.",
+        });
         await sendMessageMain("➡️  Ação: A transferência para este produto foi cancelada. Pulando para o próximo.");
         return false;
     }
@@ -581,11 +715,24 @@ export async function sendMessageMain(
             idempotencyKey,
         };
 
-        if (await sendMessage(obj)) return true;
-        return false;
+        try {
+            if (await sendMessage(obj)) return true;
+        } catch (err: unknown) {
+            const message = err instanceof Error ? err.message : String(err);
+            console.error(`❌ Falha ao enviar WhatsApp para ${number}: ${message}`);
+            registrarProblemaHomologacao({
+                tipo: "erro_whatsapp",
+                mensagem: message,
+                dados: {
+                    number,
+                    instance,
+                    linkPreview,
+                },
+            }, { resumoValor: `${number}: ${message}` });
+        }
     }
 
-    return true;
+    return false;
 }
 
 // Controle simples pra não spammar WhatsApp
@@ -603,4 +750,43 @@ async function logInfo(msg: string, enviarWhatsApp: boolean = true): Promise<voi
 }
 
 // Outras lógicas de inicialização podem ser adicionadas aqui
-main();
+process.on("uncaughtException", (err: Error) => {
+    iniciarRelatorioHomologacao();
+    registrarProblemaHomologacao({
+        tipo: "erro_inesperado",
+        contexto: "uncaughtException",
+        mensagem: err.message,
+        dados: { stack: err.stack },
+    });
+    finalizarRelatorioHomologacao("finalizado_com_erros");
+    console.error("❌ Erro fatal não tratado:", err);
+    process.exit(1);
+});
+
+process.on("unhandledRejection", (reason: unknown) => {
+    const message = reason instanceof Error ? reason.message : String(reason);
+    iniciarRelatorioHomologacao();
+    registrarProblemaHomologacao({
+        tipo: "erro_inesperado",
+        contexto: "unhandledRejection",
+        mensagem: message,
+        dados: reason instanceof Error ? { stack: reason.stack } : { reason },
+    });
+    finalizarRelatorioHomologacao("finalizado_com_erros");
+    console.error("❌ Promise rejeitada sem tratamento:", reason);
+    process.exit(1);
+});
+
+main().catch((err: unknown) => {
+    const message = err instanceof Error ? err.message : String(err);
+    iniciarRelatorioHomologacao();
+    registrarProblemaHomologacao({
+        tipo: "erro_inesperado",
+        contexto: "main",
+        mensagem: message,
+        dados: err instanceof Error ? { stack: err.stack } : { err },
+    });
+    finalizarRelatorioHomologacao("finalizado_com_erros");
+    console.error("❌ Erro fatal na execução:", err);
+    process.exit(1);
+});

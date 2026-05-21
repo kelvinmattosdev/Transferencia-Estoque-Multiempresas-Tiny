@@ -14,6 +14,82 @@ function isFrameDetachedError(e: unknown): boolean {
     return msg.includes("Navigating frame was detached") || msg.includes("LifecycleWatcher disposed");
 }
 
+function isSelectorNotFoundError(e: unknown): boolean {
+    const msg = (e as any)?.message ? String((e as any).message) : String(e);
+    return (
+        msg.includes("Waiting for selector") ||
+        msg.toLowerCase().includes("nao achei o selector") ||
+        msg.toLowerCase().includes("não achei o selector")
+    );
+}
+
+async function preencherInput(
+    page: Page,
+    selector: string,
+    value: string,
+    label: string
+): Promise<void> {
+    // Garante que o input está visível e interativo
+    await page.waitForFunction(
+        (sel) => {
+            const el = document.querySelector(sel) as HTMLInputElement | null;
+            if (!el) return false;
+            const style = window.getComputedStyle(el);
+            const visivel = style.visibility !== "hidden" && style.display !== "none";
+            return visivel && !el.disabled && !el.readOnly;
+        },
+        { timeout: 20_000 },
+        selector
+    );
+
+    const input = await page.waitForSelector(selector, { visible: true, timeout: 20_000 });
+    if (!input) {
+        throw new Error(`Input não encontrado para ${label}: ${selector}`);
+    }
+
+    await input.click({ clickCount: 3 });
+    await page.keyboard.press("Backspace");
+    await input.type(value, { delay: 100 });
+
+    // Verifica se o valor realmente entrou (às vezes o foco se perde)
+    const atual = await page.$eval(selector, (el) => (el as HTMLInputElement).value);
+    if (!atual) {
+        // Fallback: seta via JS e dispara eventos para o React/DOM
+        await page.$eval(
+            selector,
+            (el, v) => {
+                const inputEl = el as HTMLInputElement;
+                inputEl.focus();
+                inputEl.value = String(v);
+                inputEl.dispatchEvent(new Event("input", { bubbles: true }));
+                inputEl.dispatchEvent(new Event("change", { bubbles: true }));
+            },
+            value
+        );
+        console.log(`⚠️ ${label} preenchido via fallback JS.`);
+    }
+}
+
+async function salvarScreenshotDebug(
+    page: Page | null,
+    reason: string
+): Promise<string | null> {
+    if (!page) return null;
+
+    try {
+        const ts = new Date().toISOString().replace(/[:.]/g, "-");
+        const fileName = `debug-${reason}-${ts}.png`;
+        const filePath = path.resolve(process.cwd(), fileName) as `${string}.png`;
+        await page.screenshot({ path: filePath, fullPage: true });
+        console.log(`🧾 Screenshot salva em: ${filePath}`);
+        return filePath;
+    } catch (err: unknown) {
+        const e = err as { message?: string };
+        console.error("❌ Erro ao salvar screenshot de debug:", e?.message ?? String(err));
+        return null;
+    }
+}
+
 async function gotoWithRetry(
     page: Page,
     url: string,
@@ -91,6 +167,7 @@ export async function baixarPlanilhaDeposito(
     outputPath: string
 ): Promise<string> {
     let browser: Browser | null = null;
+    let page: Page | null = null;
 
     const downloadFilePath = path.resolve(outputPath);
     const outputDir = path.dirname(downloadFilePath);
@@ -126,7 +203,10 @@ export async function baixarPlanilhaDeposito(
             defaultViewport: { width: 1366, height: 768 },
         })) as Browser;
 
-        const page = await browser.newPage();
+        page = await browser.newPage();
+        if (!page) {
+            throw new Error("Falha ao criar uma nova página do Puppeteer.");
+        }
 
         console.log("🌐 Acessando o site do Tiny...");
         // timeouts padrão (evita travar em coisas do login)
@@ -135,30 +215,25 @@ export async function baixarPlanilhaDeposito(
 
         await gotoWithRetry(page, "https://erp.tiny.com.br/login", 3);
 
-
         console.log("📝 Preenchendo campo de usuário...");
-        await page.waitForSelector("#username", { timeout: 20_000 });
-        await page.click("#username");
-        await page.keyboard.type(user, { delay: 100 });
+        await preencherInput(page, "#username", user, "Usuário");
         await new Promise<void>((resolve) => setTimeout(resolve, 1000));
 
         console.log('➡️ Clicando no botão "Avançar"...');
         // Preferir click via Puppeteer (evita depender de "document" no TS)
-        const selAvancar =
-            "#kc-content-wrapper > react-login-wc > section > div > main > aside.sc-jsJBEP.hfxeyl > div > button";
-        await page.waitForSelector(selAvancar, { timeout: 20_000 });
-        await page.click(selAvancar);
-        await new Promise<void>((resolve) => setTimeout(resolve, 1000));
+        // const selAvancar =
+        //     "#kc-content-wrapper > react-login-wc > section > div > main > aside.sc-jsJBEP.hfxeyl > div > button";
+        // await page.waitForSelector(selAvancar, { timeout: 20_000 });
+        // await page.click(selAvancar);
+        // await new Promise<void>((resolve) => setTimeout(resolve, 1000));
 
         console.log("🔒 Preenchendo a senha...");
-        await page.waitForSelector("#password", { timeout: 20_000 });
-        await page.click("#password");
-        await page.keyboard.type(pass, { delay: 100 });
+        await preencherInput(page, "#password", pass, "Senha");
         await new Promise<void>((resolve) => setTimeout(resolve, 1000));
 
         console.log('🔓 Clicando no botão "Entrar"...');
         const selEntrar =
-            "#kc-content-wrapper > react-login-wc > section > div > main > aside.sc-jsJBEP.hfxeyl > div > form > button";
+            "#kc-content-wrapper > react-login-wc > section > div > main > aside.sc-eeDRCY.gRREyd > div > form > button";
         await page.waitForSelector(selEntrar, { timeout: 20_000 });
         await page.click(selEntrar);
         await new Promise<void>((resolve) => setTimeout(resolve, 5000));
@@ -261,6 +336,12 @@ export async function baixarPlanilhaDeposito(
         return downloadFilePath;
     } catch (e: unknown) {
         const err = e as { message?: string };
+        if (isSelectorNotFoundError(e)) {
+            const screenshotPath = await salvarScreenshotDebug(page, "selector-not-found");
+            if (screenshotPath) {
+                await sendMessageMain(`🧾 Screenshot salva em: ${screenshotPath}`).catch(() => { });
+            }
+        }
         console.error("❌ Erro na execução da automação:", err?.message ?? String(e));
         await sendMessageMain(`❌ Erro na execução da automação: ${err?.message ?? String(e)}`);
         throw e;
