@@ -8,7 +8,7 @@
     "dev": "tsx src/main.ts",
     "build": "tsc",
     "start": "node .",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "npm run build && node tests/spreadsheetDownload.test.mjs && node tests/debugSku.test.mjs && node tests/transferDiagnostic.test.mjs"
   },
   "repository": {
     "type": "git",

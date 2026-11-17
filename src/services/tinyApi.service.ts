@@ -33,6 +33,11 @@ type TinyApiErrorContext = {
   headers?: Record<string, unknown>;
 };
 
+export type TinyPostRequestObserver = (event:
+  | { tipo: "requisicao"; tentativa: number; url: string; body: Record<string, unknown> }
+  | { tipo: "resposta"; tentativa: number; status: number; sucesso: boolean; responseData: unknown }
+) => void;
+
 export class TinyApiError extends Error {
   status: number | string;
   url: string;
@@ -89,7 +94,7 @@ export async function getProdTiny(
       const auth = `Bearer ${empresaTiny.accessToken}`;
       const config = { headers: { Authorization: auth } };
 
-      const _urlMontada = `${_url}/produtos?${typeQuery}=${query}&situacao=${situacao}`;
+      const _urlMontada = `${_url}/produtos?${encodeURIComponent(typeQuery)}=${encodeURIComponent(String(query))}&situacao=${encodeURIComponent(String(situacao))}`;
 
       if (tentativa > 2) {
         console.log(`[Tentativa ${tentativa + 1}/${maxTentativas}] Buscando produto para a empresa ${empresa}...`);
@@ -166,7 +171,8 @@ export async function editEstoqueProdTiny(
   qtdProd: number | string,
   idEstoque: string | number,
   toEmpresa: string,
-  precoUnitario: number | string = 0
+  precoUnitario: number | string = 0,
+  requestObserver?: TinyPostRequestObserver
 ): Promise<unknown> {
   const empresaTiny = (listaEmpresasDefinidas as unknown as EmpresaTinyMin[]).find(
     (v) => v.empresa === fromEmpresa || v.nomeEmpresa.includes(fromEmpresa)
@@ -208,6 +214,10 @@ export async function editEstoqueProdTiny(
         observacoes: `Transferência entre empresas | ${fromEmpresa} ${setaMovimentacao} ${toEmpresa} | Script Kelvin`,
       };
 
+      // Observador opcional, sem acesso a cabeçalhos ou token: permite que o
+      // chamador registre o corpo exatamente antes do envio.
+      requestObserver?.({ tipo: "requisicao", tentativa: tentativa + 1, url: _urlMontada, body: data });
+
       if (tentativa > 2) {
         console.log(
           `[Tentativa ${tentativa + 1}/${maxTentativas}] Alterando estoque para a empresa ${fromEmpresa}...`
@@ -215,6 +225,11 @@ export async function editEstoqueProdTiny(
       }
 
       const response = await axios.post(_urlMontada, data, config);
+
+      requestObserver?.({
+        tipo: "resposta", tentativa: tentativa + 1, status: response.status,
+        sucesso: true, responseData: response.data,
+      });
 
       console.log(`✅ Sucesso! Estoque alterado para a empresa ${fromEmpresa}.`);
       return response.data;
@@ -228,6 +243,10 @@ export async function editEstoqueProdTiny(
       }
 
       const status = e.response.status;
+      requestObserver?.({
+        tipo: "resposta", tentativa: tentativa + 1, status,
+        sucesso: false, responseData: e.response.data,
+      });
 
       if (status === 401 || status === 403) {
         console.warn(`[API] Token inválido/expirado (Erro ${status}). Tentando revalidar...`);

@@ -14,10 +14,15 @@ import {
 
 // #### services ####
 // ## tinyApi.service.js ##
-import { editEstoqueProdTiny, getProdTiny } from "./services/tinyApi.service.js";
+import { editEstoqueProdTiny, getProdTiny, type TinyPostRequestObserver } from "./services/tinyApi.service.js";
 
 // ## sheet.service.js ##
 import { filtrarPlanilha } from "./services/sheet.service.js";
+import {
+    filtrarPorDebugSku,
+    formatarDebugSkus,
+    obterDebugSkus,
+} from "./services/debugSku.service.js";
 
 // ## session.service.js ##
 import { getAccessToken } from "./services/session.service.js";
@@ -27,6 +32,7 @@ import { conectarAoBanco } from "./services/database.service.js";
 
 // ## transferenciasDb.service.ts ##
 import { registrarTransferenciaParNoDb } from "./services/transferenciasDb.service.js";
+import { construirDiagnosticoTransferencia } from "./services/transferDiagnostic.service.js";
 
 // ## tinyPuppeteer.service.js ##
 import {
@@ -60,6 +66,7 @@ type Empresa = {
 
     userTiny: string;
     passTiny: string;
+    tokenSource?: "db" | "env";
     idDeposito: string | number;
 
     transfPositivo: boolean;
@@ -69,6 +76,11 @@ type Empresa = {
 type PlanilhaRow = {
     codigo_sku?: string | number | null;
     estoque_atual: number;
+};
+
+type SkuDuplicadoPlanilha = {
+    sku: string;
+    linhas: PlanilhaRow[];
 };
 
 type TinyProduto = {
@@ -89,6 +101,8 @@ type TinyApiError = Error & {
     status?: number;
     url?: string;
     responseData?: unknown;
+    requestData?: unknown;
+    method?: string;
 };
 
 // Payload do sendMessage (inferido pelo uso)
@@ -120,6 +134,91 @@ async function resolveCompanyIdForHistory(empresaCodigo: string): Promise<number
     return historyDbConfig.resolveCompanyId(String(empresaCodigo).toUpperCase());
 }
 
+function localizarSkusDuplicados(linhas: PlanilhaRow[]): SkuDuplicadoPlanilha[] {
+    const porSku = new Map<string, PlanilhaRow[]>();
+
+    for (const linha of linhas) {
+        if (linha.codigo_sku === undefined || linha.codigo_sku === null) continue;
+
+        const sku = String(linha.codigo_sku).trim();
+        if (!sku) continue;
+
+        const ocorrencias = porSku.get(sku) ?? [];
+        ocorrencias.push(linha);
+        porSku.set(sku, ocorrencias);
+    }
+
+    return [...porSku.entries()]
+        .filter(([, linhasDoSku]) => linhasDoSku.length > 1)
+        .map(([sku, linhasDoSku]) => ({ sku, linhas: linhasDoSku }));
+}
+
+/**
+ * Barreira de segurança: uma planilha com o mesmo SKU em mais de uma linha
+ * não é confiável para movimentação. Registramos todos os casos e bloqueamos
+ * o job antes do primeiro POST de estoque.
+ */
+async function bloquearTransferenciasPorSkusDuplicados(
+    planilhasPorEmpresa: Map<Empresa, PlanilhaRow[]>
+): Promise<void> {
+    let encontrouDuplicidade = false;
+
+    for (const [empresa, linhas] of planilhasPorEmpresa) {
+        const duplicados = localizarSkusDuplicados(linhas);
+
+        for (const duplicado of duplicados) {
+            encontrouDuplicidade = true;
+
+            let produtoTiny: TinyProduto | null = null;
+            try {
+                const resposta = (await getProdTiny(
+                    "codigo",
+                    duplicado.sku,
+                    empresa.empresa
+                )) as TinyGetProdResponse;
+                produtoTiny = resposta?.itens?.[0] ?? null;
+            } catch (err: unknown) {
+                const message = err instanceof Error ? err.message : String(err);
+                console.error(
+                    `[AVISO] Não foi possível complementar o SKU duplicado ${duplicado.sku} com dados da Tiny: ${message}`
+                );
+            }
+
+            const quantidades = duplicado.linhas.map((linha) => linha.estoque_atual);
+            const detalhes = {
+                sku: duplicado.sku,
+                empresa: empresa.empresa,
+                nome_empresa: empresa.nomeEmpresa,
+                produto_nome: produtoTiny?.descricao ?? "não localizado",
+                produto_id_tiny: produtoTiny?.id ?? "não localizado",
+                ocorrencias: duplicado.linhas.length,
+                quantidades_estoque: quantidades,
+                soma_quantidades: quantidades.reduce((total, quantidade) => total + Number(quantidade), 0),
+            };
+
+            console.error("❌ SKU DUPLICADO DETECTADO NA PLANILHA — NENHUMA TRANSFERÊNCIA SERÁ EXECUTADA PARA ESTE JOB.");
+            console.table([detalhes]);
+
+            registrarProblemaHomologacao({
+                tipo: "sku_duplicado_planilha",
+                sku: duplicado.sku,
+                empresa: empresa.empresa,
+                nomeEmpresa: empresa.nomeEmpresa,
+                mensagem: `SKU ${duplicado.sku} aparece ${duplicado.linhas.length} vezes na planilha. Execução bloqueada por segurança.`,
+                dados: detalhes,
+            }, { resumoValor: `${empresa.empresa}:${duplicado.sku}` });
+        }
+    }
+
+    if (!encontrouDuplicidade) return;
+
+    const msg = "❌ Execução bloqueada: foram encontrados SKUs duplicados nas planilhas. Corrija as duplicidades e execute novamente. Nenhuma movimentação de estoque foi enviada.";
+    console.error(msg);
+    await sendMessageMain(msg);
+    finalizarRelatorioHomologacao("finalizado_com_erros");
+    process.exit(1);
+}
+
 async function main(): Promise<void> {
     iniciarRelatorioHomologacao();
     await allValidations();
@@ -136,8 +235,17 @@ async function main(): Promise<void> {
         throw new Error("listaEmpresasDefinidas não foi inicializada.");
     }
     const empresasDefinidas = listaEmpresasDefinidas;
+    const debugSkus = obterDebugSkus();
+    if (debugSkus) {
+        console.warn(`🐞 DEBUG_SKU ativo: somente os SKUs [${formatarDebugSkus(debugSkus)}] poderão gerar movimentações.`);
+    }
 
     // Baixa cada uma das planilhas de estoque (exceto da empresa principal)
+    const planilhasCompletasPorEmpresa = new Map<Empresa, PlanilhaRow[]>();
+    const planilhasFiltradasPorEmpresa = new Map<Empresa, PlanilhaRow[]>();
+
+    // Pré-validação completa: não movimenta nenhuma empresa antes de garantir
+    // que todas as planilhas elegíveis não contêm SKU duplicado.
     for (const empresa of empresasDefinidas) {
         if (empresa.isMaster) continue; // Pula a empresa principal
         const e = empresa;
@@ -161,7 +269,8 @@ async function main(): Promise<void> {
             e.userTiny,
             e.passTiny,
             idDeposito,
-            `./data/inventario-${e.empresa.toLowerCase()}.xls`
+            `./data/inventario-${e.empresa.toLowerCase()}.xls`,
+            e.empresa
         );
 
         console.log(caminhoPlanilha);
@@ -174,6 +283,25 @@ async function main(): Promise<void> {
 
     for (const empresa of empresasDefinidas) {
         if (empresa.isMaster) continue; // Pula a empresa principal
+
+        const caminhoPlanilha = `./data/inventario-${empresa.empresa.toLowerCase()}.xls`;
+        const linhasCompletas = filtrarPlanilha(caminhoPlanilha, "F", "") as PlanilhaRow[];
+        planilhasCompletasPorEmpresa.set(empresa, linhasCompletas);
+
+        if (debugSkus) {
+            const saldosDebug = filtrarPorDebugSku(linhasCompletas, debugSkus);
+            for (const linha of saldosDebug) {
+                console.log(
+                    `🐞 DEBUG_SKU | SKU=${String(linha.codigo_sku)} | empresa=${empresa.empresa} | saldo=${linha.estoque_atual}`
+                );
+            }
+            const encontrados = new Set(saldosDebug.map((linha) => String(linha.codigo_sku).trim().toUpperCase()));
+            for (const sku of debugSkus) {
+                if (!encontrados.has(sku)) {
+                    console.log(`🐞 DEBUG_SKU | SKU=${sku} | empresa=${empresa.empresa} | saldo=não localizado na planilha`);
+                }
+            }
+        }
 
         const filterMap: Record<string, string | null> = {
             true_true: "!=0", // pode positivos e negativos → diferente de zero
@@ -192,29 +320,36 @@ async function main(): Promise<void> {
             continue;
         }
 
-        const a = filtrarPlanilha(
-            `./data/inventario-${empresa.empresa.toLowerCase()}.xls`,
+        const linhasComSaldo = filtrarPlanilha(
+            caminhoPlanilha,
             "F",
             filtro
         ) as PlanilhaRow[];
+        const a = filtrarPorDebugSku(linhasComSaldo, debugSkus);
 
         const messageEstoque =
             filtro === "<0" ? "menor que 0" : filtro === ">0" ? "maior que 0" : "diferente de 0";
 
         console.log(
-            `Foram localizados ${a.length} produtos com o estoque ${messageEstoque} na empresa ${empresa.nomeEmpresa}`
+            `Foram localizados ${a.length} produtos com o estoque ${messageEstoque} na empresa ${empresa.nomeEmpresa}${debugSkus ? " (filtrado por DEBUG_SKU)" : ""}`
         );
 
-        const objEmpresaMaster = empresasDefinidas.find((v) => v.isMaster === true);
-        if (!objEmpresaMaster) {
-            registrarProblemaHomologacao({
-                tipo: "erro_validacao",
-                mensagem: "Empresa Master não encontrada em listaEmpresasDefinidas.",
-            });
-            finalizarRelatorioHomologacao("finalizado_com_erros");
-            throw new Error("Empresa Master não encontrada em listaEmpresasDefinidas.");
-        }
+        planilhasFiltradasPorEmpresa.set(empresa, a);
+    }
 
+    await bloquearTransferenciasPorSkusDuplicados(planilhasCompletasPorEmpresa);
+
+    const objEmpresaMaster = empresasDefinidas.find((v) => v.isMaster === true);
+    if (!objEmpresaMaster) {
+        registrarProblemaHomologacao({
+            tipo: "erro_validacao",
+            mensagem: "Empresa Master não encontrada em listaEmpresasDefinidas.",
+        });
+        finalizarRelatorioHomologacao("finalizado_com_erros");
+        throw new Error("Empresa Master não encontrada em listaEmpresasDefinidas.");
+    }
+
+    for (const [empresa, a] of planilhasFiltradasPorEmpresa) {
         for (const p of a) {
             if (!p.codigo_sku) {
                 registrarProblemaHomologacao({
@@ -225,6 +360,16 @@ async function main(): Promise<void> {
                     dados: { estoque_atual: p.estoque_atual },
                 });
                 continue;
+            }
+            if (debugSkus) {
+                const direcao = p.estoque_atual > 0
+                    ? `${empresa.empresa} → ${objEmpresaMaster.empresa}`
+                    : p.estoque_atual < 0
+                        ? `${objEmpresaMaster.empresa} → ${empresa.empresa}`
+                        : "sem movimentação";
+                console.log(
+                    `🐞 DEBUG_SKU | transferência prevista | SKU=${String(p.codigo_sku)} | saldo=${p.estoque_atual} | direção=${direcao}`
+                );
             }
             const ok = await transfEstoque(p, empresa, objEmpresaMaster);
             if (!ok) continue;
@@ -375,6 +520,41 @@ async function transfEstoque(
     objEmpresaMaster: Empresa
 ): Promise<boolean> {
     const sku = p.codigo_sku;
+    const skuTexto = String(sku ?? "");
+    const urlBuscaProduto = `https://api.tiny.com.br/public-api/v3/produtos?codigo=${encodeURIComponent(skuTexto)}&situacao=A`;
+    const rastreioTransferencia = {
+        sku: skuTexto,
+        saldoPlanilha: Number(p.estoque_atual),
+        consultasProduto: {
+            master: { empresa: objEmpresaMaster.empresa, url: urlBuscaProduto, produtoSelecionado: null as { id: string | number; descricao?: string } | null, resultado: { sucesso: false, status: null as number | string | null, responseData: null as unknown } },
+            filial: { empresa: empresaFilial.empresa, url: urlBuscaProduto, produtoSelecionado: null as { id: string | number; descricao?: string } | null, resultado: { sucesso: false, status: null as number | string | null, responseData: null as unknown } },
+        },
+        depositos: {} as Record<string, { empresa: string; valor: string | number; origem: string }>,
+        autenticacao: {
+            master: { empresa: objEmpresaMaster.empresa, origem: `${objEmpresaMaster.empresa}_TOKEN_SOURCE`, fonte: objEmpresaMaster.tokenSource ?? "desconhecida" as "db" | "env" | "desconhecida" },
+            filial: { empresa: empresaFilial.empresa, origem: `${empresaFilial.empresa}_TOKEN_SOURCE`, fonte: empresaFilial.tokenSource ?? "desconhecida" as "db" | "env" | "desconhecida" },
+        },
+        movimentacoes: [] as Array<{ etapa: string; empresa: string; tentativa?: number; url: string; body: Record<string, unknown>; resultado: { status?: number | string | null; responseData?: unknown; sucesso?: boolean } }>,
+    };
+    let consultaEmAndamento: "master" | "filial" | null = null;
+    let postagemEmAndamento: { etapa: string; empresa: string } | null = null;
+    const indicesTentativasPost = new Map<number, number>();
+    const observarPostEfetivo = (evento: Parameters<TinyPostRequestObserver>[0]): void => {
+        if (!postagemEmAndamento) return;
+        if (evento.tipo === "requisicao") {
+            const indice = rastreioTransferencia.movimentacoes.push({
+                ...postagemEmAndamento, tentativa: evento.tentativa, url: evento.url, body: evento.body,
+                resultado: { sucesso: false, status: null },
+            }) - 1;
+            indicesTentativasPost.set(evento.tentativa, indice);
+            return;
+        }
+        const indice = indicesTentativasPost.get(evento.tentativa);
+        if (indice === undefined) return;
+        rastreioTransferencia.movimentacoes[indice].resultado = {
+            sucesso: evento.sucesso, status: evento.status, responseData: evento.responseData,
+        };
+    };
 
     if (sku === undefined || sku === null || sku === "") {
         console.warn("[WARN] Linha da planilha sem SKU (codigo_sku vazio). Pulando.");
@@ -423,11 +603,13 @@ async function transfEstoque(
         // ==================================================================
         // ETAPA 1: BUSCAR E VALIDAR PRODUTOS (LÓGICA CENTRALIZADA)
         // ==================================================================
+        consultaEmAndamento = "master";
         const resProdMaster = (await getProdTiny(
             "codigo",
             sku,
             objEmpresaMaster.empresa
         )) as TinyGetProdResponse;
+        rastreioTransferencia.consultasProduto.master.resultado = { sucesso: true, status: 200, responseData: resProdMaster };
 
         const prodMaster = resProdMaster?.itens?.[0];
         if (!prodMaster) {
@@ -442,13 +624,16 @@ async function transfEstoque(
             });
             return false;
         }
+        rastreioTransferencia.consultasProduto.master.produtoSelecionado = { id: prodMaster.id, descricao: prodMaster.descricao };
         console.log(`[OK] Localizado na Master: ${prodMaster.descricao} (ID: ${prodMaster.id})`);
 
+        consultaEmAndamento = "filial";
         const resProdFilial = (await getProdTiny(
             "codigo",
             sku,
             empresaFilial.empresa
         )) as TinyGetProdResponse;
+        rastreioTransferencia.consultasProduto.filial.resultado = { sucesso: true, status: 200, responseData: resProdFilial };
 
         const prodFilial = resProdFilial?.itens?.[0];
         if (!prodFilial) {
@@ -463,6 +648,7 @@ async function transfEstoque(
             });
             return false;
         }
+        rastreioTransferencia.consultasProduto.filial.produtoSelecionado = { id: prodFilial.id, descricao: prodFilial.descricao };
         console.log(`[OK] Localizado na Filial: ${prodFilial.descricao} (ID: ${prodFilial.id})`);
 
         // ==================================================================
@@ -470,6 +656,11 @@ async function transfEstoque(
         // ==================================================================
         const idDepFilial = empresaFilial.idDeposito;
         const idDepMaster = objEmpresaMaster.idDeposito;
+
+        rastreioTransferencia.depositos = {
+            master: { empresa: objEmpresaMaster.empresa, valor: idDepMaster, origem: `${objEmpresaMaster.empresa}_ID_DEPOSITO` },
+            filial: { empresa: empresaFilial.empresa, valor: idDepFilial, origem: `${empresaFilial.empresa}_ID_DEPOSITO` },
+        };
 
         if (idDepFilial === undefined || idDepFilial === null || idDepFilial === "") {
             const msg = `❌ Filial ${empresaFilial.empresa} sem idDeposito. Abortando SKU ${String(p.codigo_sku)}.`;
@@ -508,23 +699,25 @@ async function transfEstoque(
             );
 
             // Saída da Filial
+            postagemEmAndamento = { etapa: "saida_filial", empresa: empresaFilial.empresa };
             const respSaida = await editEstoqueProdTiny(
                 empresaFilial.empresa,
                 prodFilial.id,
                 "S",
                 qtdAbs,
                 idDepFilial,
-                objEmpresaMaster.empresa
+                objEmpresaMaster.empresa, 0, observarPostEfetivo
             );
 
             // Entrada na Master
+            postagemEmAndamento = { etapa: "entrada_master", empresa: objEmpresaMaster.empresa };
             const respEntrada = await editEstoqueProdTiny(
                 objEmpresaMaster.empresa,
                 prodMaster.id,
                 "E",
                 qtdAbs,
                 idDepMaster,
-                empresaFilial.empresa
+                empresaFilial.empresa, 0, observarPostEfetivo
             );
 
             // ✅ Só grava depois que as duas deram OK
@@ -570,23 +763,25 @@ async function transfEstoque(
             );
 
             // Saída da Master
+            postagemEmAndamento = { etapa: "saida_master", empresa: objEmpresaMaster.empresa };
             const respSaida = await editEstoqueProdTiny(
                 objEmpresaMaster.empresa,
                 prodMaster.id,
                 "S",
                 qtdAbs,
                 idDepMaster,
-                empresaFilial.empresa
+                empresaFilial.empresa, 0, observarPostEfetivo
             );
 
             // Entrada na Filial
+            postagemEmAndamento = { etapa: "entrada_filial", empresa: empresaFilial.empresa };
             const respEntrada = await editEstoqueProdTiny(
                 empresaFilial.empresa,
                 prodFilial.id,
                 "E",
                 qtdAbs,
                 idDepFilial,
-                objEmpresaMaster.empresa
+                objEmpresaMaster.empresa, 0, observarPostEfetivo
             );
 
             // ✅ Só grava depois que as duas deram OK
@@ -633,23 +828,31 @@ async function transfEstoque(
         const error = err as Partial<TinyApiError> & { message?: string };
 
         if (error?.name === "TinyApiError") {
+            if (error.method === "GET" && consultaEmAndamento) {
+                rastreioTransferencia.consultasProduto[consultaEmAndamento].resultado = {
+                    sucesso: false, status: error.status ?? null, responseData: error.responseData,
+                };
+                if (error.url) rastreioTransferencia.consultasProduto[consultaEmAndamento].url = error.url;
+            }
+            if (error.method === "POST") {
+                const corpoErro = (error.requestData && typeof error.requestData === "object" && !Array.isArray(error.requestData)) ? error.requestData as Record<string, unknown> : {};
+                if (postagemEmAndamento && indicesTentativasPost.size === 0) {
+                    rastreioTransferencia.movimentacoes.push({ ...postagemEmAndamento, url: error.url ?? "URL não informada", body: corpoErro, resultado: { sucesso: false, status: error.status, responseData: error.responseData } });
+                }
+            }
+            const diagnostico = construirDiagnosticoTransferencia(rastreioTransferencia);
             console.error(`❌ Falha de API ao processar o SKU: ${String(p.codigo_sku)}.`);
-            console.error(`   - Status: ${String(error.status)}`);
-            console.error(`   - URL: ${String(error.url)}`);
-            console.error(`   - Resposta da API: ${JSON.stringify(error.responseData)}`);
+            console.error("   - Diagnóstico da transferência (dados sanitizados):");
+            console.error(JSON.stringify(diagnostico, null, 2));
             registrarProblemaHomologacao({
                 tipo: "erro_api_tiny",
                 sku: String(p.codigo_sku),
-                empresa: empresaFilial.empresa,
-                nomeEmpresa: empresaFilial.nomeEmpresa,
+                empresa: (postagemEmAndamento?.empresa === objEmpresaMaster.empresa || consultaEmAndamento === "master") ? objEmpresaMaster.empresa : empresaFilial.empresa,
+                nomeEmpresa: (postagemEmAndamento?.empresa === objEmpresaMaster.empresa || consultaEmAndamento === "master") ? objEmpresaMaster.nomeEmpresa : empresaFilial.nomeEmpresa,
                 mensagem: error.message ?? `Falha de API Tiny ao processar SKU ${String(p.codigo_sku)}.`,
                 status: error.status ?? null,
                 url: error.url ?? null,
-                responseData: error.responseData,
-                dados: {
-                    empresa_master: objEmpresaMaster.empresa,
-                    empresa_filial: empresaFilial.empresa,
-                },
+                dados: diagnostico,
             });
 
             if (error.status === 404) {
@@ -659,24 +862,28 @@ async function transfEstoque(
             }
 
             await sendMessageMain(`❌ Falha de API ao processar o SKU: ${String(p.codigo_sku)}.
-- Causa Provável: O ID de um produto ou depósito não foi encontrado durante a movimentação.
-- Status: ${String(error.status)}
-- URL: ${String(error.url)}
-- Resposta da API: ${JSON.stringify(error.responseData)}`);
+- Status: ${String(error.status)}. Consulte o relatório de homologação para o diagnóstico sanitizado da transferência.`);
         } else {
+            const diagnostico = construirDiagnosticoTransferencia(rastreioTransferencia);
+            const empresaComFalha = (postagemEmAndamento?.empresa === objEmpresaMaster.empresa || consultaEmAndamento === "master")
+                ? objEmpresaMaster
+                : empresaFilial;
             console.error(
                 `❌ Ocorreu um erro inesperado no processamento do SKU ${String(p.codigo_sku)}:`,
                 error?.message ?? error
             );
+            if (rastreioTransferencia.movimentacoes.length > 0 || consultaEmAndamento) {
+                console.error("   - Diagnóstico da transferência (dados sanitizados):");
+                console.error(JSON.stringify(diagnostico, null, 2));
+            }
             registrarProblemaHomologacao({
                 tipo: "erro_inesperado",
                 sku: String(p.codigo_sku),
-                empresa: empresaFilial.empresa,
-                nomeEmpresa: empresaFilial.nomeEmpresa,
+                empresa: empresaComFalha.empresa,
+                nomeEmpresa: empresaComFalha.nomeEmpresa,
                 mensagem: error?.message ?? String(error),
                 dados: {
-                    empresa_master: objEmpresaMaster.empresa,
-                    empresa_filial: empresaFilial.empresa,
+                    diagnostico_transferencia: diagnostico,
                 },
             });
             await sendMessageMain(

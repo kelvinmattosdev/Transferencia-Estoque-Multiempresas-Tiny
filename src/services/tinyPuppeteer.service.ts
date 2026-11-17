@@ -5,9 +5,10 @@ import StealthPlugin from "puppeteer-extra-plugin-stealth";
 import https from "node:https";
 import fs from "node:fs";
 import path from "node:path";
-import type { Browser } from "puppeteer";
+import type { Browser, BrowserContext } from "puppeteer";
 import { sendMessageMain } from "../main.js";
 import type { Page } from "puppeteer-core"; // pode colocar junto com os imports
+import { baixarPlanilhaComValidacao } from "./spreadsheetDownload.service.js";
 
 function isFrameDetachedError(e: unknown): boolean {
     const msg = (e as any)?.message ? String((e as any).message) : String(e);
@@ -136,6 +137,42 @@ async function _encerrarExecucao(browser: Browser | null): Promise<void> {
     }
 }
 
+/**
+ * O download de cada empresa/tentativa deve partir de uma sessão totalmente nova.
+ * O contexto isolado já não compartilha dados com outros contextos; a limpeza
+ * explícita também elimina qualquer dado criado antes do formulário de login.
+ */
+async function limparDadosDeAutenticacao(page: Page): Promise<void> {
+    const client = await page.target().createCDPSession();
+    const origins = [
+        "https://erp.tiny.com.br",
+        "https://tiny.com.br",
+        "https://erp.olist.com",
+        "https://olist.com",
+    ];
+
+    try {
+        const cookies = await page.cookies();
+        if (cookies.length > 0) {
+            await page.deleteCookie(...cookies);
+        }
+
+        await client.send("Network.clearBrowserCookies");
+        await client.send("Network.clearBrowserCache");
+
+        for (const origin of origins) {
+            await client.send("Storage.clearDataForOrigin", {
+                origin,
+                storageTypes: "all",
+            });
+        }
+
+        console.log("🧼 Dados de autenticação do Tiny/Olist removidos do contexto isolado.");
+    } finally {
+        await client.detach().catch(() => { });
+    }
+}
+
 // Função auxiliar só para caçar o caminho do Chrome
 function resolveChromePath(): string | undefined {
     if (process.env.PUPPETEER_EXECUTABLE_PATH) {
@@ -160,13 +197,14 @@ function resolveChromePath(): string | undefined {
  * @param outputPath - Caminho completo (incluindo nome do arquivo) onde a planilha será salva.
  * @returns O caminho completo para o arquivo baixado.
  */
-export async function baixarPlanilhaDeposito(
+async function baixarPlanilhaDepositoUmaTentativa(
     user: string,
     pass: string,
     idDeposito: string | number,
     outputPath: string
 ): Promise<string> {
     let browser: Browser | null = null;
+    let browserContext: BrowserContext | null = null;
     let page: Page | null = null;
 
     const downloadFilePath = path.resolve(outputPath);
@@ -203,7 +241,10 @@ export async function baixarPlanilhaDeposito(
             defaultViewport: { width: 1366, height: 768 },
         })) as Browser;
 
-        page = await browser.newPage();
+        // Não use o contexto padrão: cada tentativa recebe um storage partition
+        // próprio e é descartada antes de processar a próxima empresa.
+        browserContext = await browser.createBrowserContext();
+        page = await browserContext.newPage();
         if (!page) {
             throw new Error("Falha ao criar uma nova página do Puppeteer.");
         }
@@ -212,6 +253,8 @@ export async function baixarPlanilhaDeposito(
         // timeouts padrão (evita travar em coisas do login)
         page.setDefaultTimeout(90_000);
         page.setDefaultNavigationTimeout(90_000);
+
+        await limparDadosDeAutenticacao(page);
 
         await gotoWithRetry(page, "https://erp.tiny.com.br/login", 3);
 
@@ -275,11 +318,8 @@ export async function baixarPlanilhaDeposito(
             };
 
             fileStream.on("error", async (err: unknown) => {
-                const e = err as { message?: string };
-                console.error("❌ Erro ao escrever o arquivo:", e?.message ?? String(err));
-                await sendMessageMain(`❌ Erro ao escrever o arquivo: ${e?.message ?? String(err)}`).catch(
-                    () => { }
-                );
+                console.error("❌ Erro ao escrever o arquivo de download.");
+                await sendMessageMain("❌ Erro ao escrever o arquivo de download.").catch(() => { });
 
                 try {
                     if (fs.existsSync(downloadFilePath)) fs.unlinkSync(downloadFilePath);
@@ -292,6 +332,7 @@ export async function baixarPlanilhaDeposito(
                 if (response.statusCode !== 200) {
                     void sendMessageMain(`❌ Falha no download: HTTP ${response.statusCode}`).catch(() => { });
                     response.resume();
+                    fileStream.destroy();
                     return reject(new Error(`Falha no download: HTTP ${response.statusCode}`));
                 }
 
@@ -301,6 +342,9 @@ export async function baixarPlanilhaDeposito(
                     try {
                         fileStream.close();
                     } catch { }
+                });
+
+                fileStream.on("close", () => {
                     console.log("✅ Download concluído com sucesso!");
                     resolve();
                 });
@@ -319,11 +363,8 @@ export async function baixarPlanilhaDeposito(
             });
 
             request.on("error", async (err: unknown) => {
-                const e = err as { message?: string };
-                console.error("❌ Erro na requisição HTTPS:", e?.message ?? String(err));
-                await sendMessageMain(`❌ Erro na requisição de download: ${e?.message ?? String(err)}`).catch(
-                    () => { }
-                );
+                console.error("❌ Erro na requisição HTTPS de download.");
+                await sendMessageMain("❌ Erro na requisição de download.").catch(() => { });
 
                 try {
                     if (fs.existsSync(downloadFilePath)) fs.unlinkSync(downloadFilePath);
@@ -335,18 +376,60 @@ export async function baixarPlanilhaDeposito(
 
         return downloadFilePath;
     } catch (e: unknown) {
-        const err = e as { message?: string };
         if (isSelectorNotFoundError(e)) {
             const screenshotPath = await salvarScreenshotDebug(page, "selector-not-found");
             if (screenshotPath) {
                 await sendMessageMain(`🧾 Screenshot salva em: ${screenshotPath}`).catch(() => { });
             }
         }
-        console.error("❌ Erro na execução da automação:", err?.message ?? String(e));
-        await sendMessageMain(`❌ Erro na execução da automação: ${err?.message ?? String(e)}`);
+        console.error("❌ Erro na execução da automação de download.");
+        await sendMessageMain("❌ Erro na execução da automação de download.");
         throw e;
     } finally {
+        if (page) {
+            try {
+                await limparDadosDeAutenticacao(page);
+            } catch {
+                // A limpeza no encerramento não pode mascarar o erro original.
+                console.error("❌ Não foi possível limpar os dados de autenticação no encerramento.");
+            }
+        }
+        if (browserContext) {
+            try {
+                await browserContext.close();
+                console.log("🧼 Contexto isolado do Puppeteer descartado.");
+            } catch (e: unknown) {
+                const err = e as { message?: string };
+                console.error("❌ Erro ao descartar o contexto isolado:", err?.message ?? String(e));
+            }
+        }
         await _encerrarExecucao(browser);
+    }
+}
+
+/**
+ * Faz até três ciclos completos de login, download e validação da planilha.
+ * Um retorno desta função garante que o arquivo é legível pelo xlsx e possui
+ * as colunas de SKU e estoque esperadas pelo fluxo de transferência.
+ */
+export async function baixarPlanilhaDeposito(
+    user: string,
+    pass: string,
+    idDeposito: string | number,
+    outputPath: string,
+    empresa = "desconhecida"
+): Promise<string> {
+    try {
+        return await baixarPlanilhaComValidacao({
+            empresa,
+            outputPath,
+            baixar: () => baixarPlanilhaDepositoUmaTentativa(user, pass, idDeposito, outputPath),
+        });
+    } catch (erro: unknown) {
+        const mensagem = erro instanceof Error ? erro.message : "Falha ao validar a planilha baixada.";
+        console.error(`❌ ${mensagem}`);
+        await sendMessageMain(`❌ ${mensagem}`).catch(() => { });
+        throw erro;
     }
 }
 

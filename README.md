@@ -55,6 +55,7 @@ O script encerrará a execução e avisará qual informação está faltando cas
 | `DB_DATABASE` | Sim | O nome do banco de dados a ser utilizado. |
 | `DB_SSL` | Sim | Defina como `true` ou `false` para habilitar ou desabilitar a conexão SSL. |
 | `ACTIVE_COMPANIES` | Sim | Uma lista de siglas de empresas separadas por vírgula (ex: `JP,LT,JF`). |
+| `DEBUG_SKU` | Não | Restringe movimentações aos SKUs informados, preservando download e validações. Aceita `JP1234` ou `JP1234,JP4321`. |
 
 ### Configuração por Empresa
 
